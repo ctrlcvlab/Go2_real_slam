@@ -1,16 +1,8 @@
 # patches
 
-외부 dependency에 대한 로컬 변경분만 patch로 보관합니다.
+외부 dependency에 대한 patch를 보관하는 폴더입니다.
 
-현재 포함된 patch:
+현재 `point_lio_ros2`는 원본 clone 상태로 유지하고,
+Go2 전용 launch/config는 모두 `/home/cvr/Desktop/sj/go2_slam_nav`에서 직접 관리합니다.
 
-* `point_lio_utlidar_synced.patch`
-  * 대상: 외부 `point_lio_ros2` 저장소
-  * 내용: Go2용 `utlidar_synced` 설정/launch 3개 파일 추가
-
-적용 예시:
-
-```bash
-cd /home/cvr/Desktop/sj/go2_stack_ws/src/point_lio_ros2
-git apply /home/cvr/Desktop/sj/go2_slam_nav/patches/point_lio_utlidar_synced.patch
-```
+따라서 현재 이 폴더에는 적용 중인 `point_lio_ros2` patch가 없습니다.

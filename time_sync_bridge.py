@@ -1,5 +1,5 @@
 import time
-from math import cos, sin
+from math import atan2, cos, sin
 import os
 
 import numpy as np
@@ -42,6 +42,7 @@ class TimeSyncBridge(Node):
         # (RViz에서는 이 _synced 토픽들을 화면에 띄우시면 됩니다!)
         self.grid_map_pub = self.create_publisher(PointCloud2, '/utlidar/grid_map_synced', 10)
         self.odom_pub = self.create_publisher(Odometry, '/utlidar/robot_odom_synced', 10)
+        self.planar_odom_pub = self.create_publisher(Odometry, '/utlidar/robot_odom_planar_synced', 10)
         self.pose_pub = self.create_publisher(PoseStamped, '/utlidar/robot_pose_synced', 10)
         self.imu_pub = self.create_publisher(Imu, '/utlidar/imu_synced', 10)
         self.cloud_pub = self.create_publisher(PointCloud2, '/utlidar/cloud_deskewed_synced', 10)
@@ -64,6 +65,7 @@ class TimeSyncBridge(Node):
         self.publish_sensor_static_transforms()
         self.load_pointlio_calibration()
         self.init_pointlio_transform()
+        self.init_planar_odom_filter()
 
         self.get_logger().info("==============================================")
         self.get_logger().info("🚀 Time Sync Bridge 노드가 성공적으로 시작되었습니다!")
@@ -113,6 +115,13 @@ class TimeSyncBridge(Node):
         self.z_filter_min = -0.6 - self.cam_offset
         self.z_filter_max = 0.0 - self.cam_offset
 
+    def init_planar_odom_filter(self):
+        self.planar_linear_deadband_xy = 0.02
+        self.planar_linear_deadband_z = 0.05
+        self.planar_angular_deadband_xy = 0.02
+        self.planar_angular_deadband_z = 0.04
+        self.last_planar_pose = None
+
     def is_in_pointlio_filter_box(self, x, y, z):
         return (
             self.x_filter_min < x < self.x_filter_max and
@@ -152,19 +161,28 @@ class TimeSyncBridge(Node):
         self.pointlio_cloud_pub.publish(pointlio_cloud)
 
     def publish_pointlio_imu(self, msg):
-        x = msg.angular_velocity.x
-        y = -msg.angular_velocity.y
-        z = -msg.angular_velocity.z
+        ang_x = msg.angular_velocity.x
+        ang_y = -msg.angular_velocity.y
+        ang_z = -msg.angular_velocity.z
+        acc_x = msg.linear_acceleration.x
+        acc_y = -msg.linear_acceleration.y
+        acc_z = -msg.linear_acceleration.z
 
-        x2 = self.imu_cos * x - self.imu_sin * z
-        y2 = y
-        z2 = self.imu_sin * x + self.imu_cos * z
+        ang_x2 = self.imu_cos * ang_x - self.imu_sin * ang_z
+        ang_y2 = ang_y
+        ang_z2 = self.imu_sin * ang_x + self.imu_cos * ang_z
+        acc_x2 = self.imu_cos * acc_x - self.imu_sin * acc_z
+        acc_y2 = acc_y
+        acc_z2 = self.imu_sin * acc_x + self.imu_cos * acc_z
 
-        x2 -= self.ang_bias_x
-        y2 -= self.ang_bias_y
-        z2 -= self.ang_bias_z
-        x2 += self.ang_z2x_proj * z2
-        y2 += self.ang_z2y_proj * z2
+        ang_x2 -= self.ang_bias_x
+        ang_y2 -= self.ang_bias_y
+        ang_z2 -= self.ang_bias_z
+        ang_x2 += self.ang_z2x_proj * ang_z2
+        ang_y2 += self.ang_z2y_proj * ang_z2
+        acc_x2 -= self.acc_bias_x
+        acc_y2 -= self.acc_bias_y
+        acc_z2 -= self.acc_bias_z
 
         pointlio_imu = Imu()
         pointlio_imu.header.stamp = msg.header.stamp
@@ -173,12 +191,12 @@ class TimeSyncBridge(Node):
         pointlio_imu.orientation.y = 0.0
         pointlio_imu.orientation.z = 0.0
         pointlio_imu.orientation.w = 1.0
-        pointlio_imu.angular_velocity.x = x2
-        pointlio_imu.angular_velocity.y = y2
-        pointlio_imu.angular_velocity.z = z2
-        pointlio_imu.linear_acceleration.x = 0.0
-        pointlio_imu.linear_acceleration.y = 0.0
-        pointlio_imu.linear_acceleration.z = 0.0
+        pointlio_imu.angular_velocity.x = ang_x2
+        pointlio_imu.angular_velocity.y = ang_y2
+        pointlio_imu.angular_velocity.z = ang_z2
+        pointlio_imu.linear_acceleration.x = acc_x2
+        pointlio_imu.linear_acceleration.y = acc_y2
+        pointlio_imu.linear_acceleration.z = acc_z2
 
         self.pointlio_imu_pub.publish(pointlio_imu)
 
@@ -270,6 +288,7 @@ class TimeSyncBridge(Node):
         new_stamp = self.apply_time_offset(msg.header.stamp, 'odom')
         msg.header.stamp = new_stamp
         self.odom_pub.publish(msg)
+        self.publish_planar_odom(msg)
 
         if self.should_publish_odom_tf(msg):
             transform = TransformStamped()
@@ -348,6 +367,70 @@ class TimeSyncBridge(Node):
             cr * cp * sy - sr * sp * cy,
             cr * cp * cy + sr * sp * sy,
         )
+
+    def yaw_from_quaternion(self, quaternion):
+        siny_cosp = 2.0 * (
+            quaternion.w * quaternion.z + quaternion.x * quaternion.y
+        )
+        cosy_cosp = 1.0 - 2.0 * (
+            quaternion.y * quaternion.y + quaternion.z * quaternion.z
+        )
+        return atan2(siny_cosp, cosy_cosp)
+
+    def is_stationary_odom(self, msg):
+        linear = msg.twist.twist.linear
+        angular = msg.twist.twist.angular
+        return (
+            abs(linear.x) < self.planar_linear_deadband_xy and
+            abs(linear.y) < self.planar_linear_deadband_xy and
+            abs(linear.z) < self.planar_linear_deadband_z and
+            abs(angular.x) < self.planar_angular_deadband_xy and
+            abs(angular.y) < self.planar_angular_deadband_xy and
+            abs(angular.z) < self.planar_angular_deadband_z
+        )
+
+    def publish_planar_odom(self, msg):
+        planar_odom = Odometry()
+        planar_odom.header = msg.header
+        planar_odom.child_frame_id = msg.child_frame_id
+
+        yaw = self.yaw_from_quaternion(msg.pose.pose.orientation)
+        planar_x = msg.pose.pose.position.x
+        planar_y = msg.pose.pose.position.y
+
+        if self.last_planar_pose is None:
+            self.last_planar_pose = (planar_x, planar_y, yaw)
+        elif self.is_stationary_odom(msg):
+            planar_x, planar_y, yaw = self.last_planar_pose
+        else:
+            self.last_planar_pose = (planar_x, planar_y, yaw)
+
+        planar_odom.pose.pose.position.x = planar_x
+        planar_odom.pose.pose.position.y = planar_y
+        planar_odom.pose.pose.position.z = 0.0
+
+        qx, qy, qz, qw = self.quaternion_from_euler(0.0, 0.0, yaw)
+        planar_odom.pose.pose.orientation.x = qx
+        planar_odom.pose.pose.orientation.y = qy
+        planar_odom.pose.pose.orientation.z = qz
+        planar_odom.pose.pose.orientation.w = qw
+
+        planar_odom.twist.twist.linear.x = msg.twist.twist.linear.x
+        planar_odom.twist.twist.linear.y = msg.twist.twist.linear.y
+        planar_odom.twist.twist.linear.z = 0.0
+        planar_odom.twist.twist.angular.x = 0.0
+        planar_odom.twist.twist.angular.y = 0.0
+        planar_odom.twist.twist.angular.z = msg.twist.twist.angular.z
+
+        planar_odom.pose.covariance = list(msg.pose.covariance)
+        planar_odom.twist.covariance = list(msg.twist.covariance)
+        planar_odom.pose.covariance[14] = max(planar_odom.pose.covariance[14], 1.0)
+        planar_odom.pose.covariance[21] = max(planar_odom.pose.covariance[21], 1.0)
+        planar_odom.pose.covariance[28] = max(planar_odom.pose.covariance[28], 1.0)
+        planar_odom.twist.covariance[14] = max(planar_odom.twist.covariance[14], 1.0)
+        planar_odom.twist.covariance[21] = max(planar_odom.twist.covariance[21], 1.0)
+
+        self.planar_odom_pub.publish(planar_odom)
 
     def should_publish_odom_tf(self, msg):
         # RViz needs a live odom->base_link transform even when the robot
